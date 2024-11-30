@@ -14,6 +14,8 @@ import (
 	"gopkg.in/inconshreveable/log15.v2"
 )
 
+const VV = "v0.1.0"
+
 func init() { tunnel.SetVV(VV) } // propagate version
 
 func main() {

@@ -11,7 +11,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-
 	// imported per documentation - https://golang.org/pkg/net/http/pprof/
 	_ "net/http/pprof"
 	"net/url"
@@ -30,20 +29,20 @@ var _ fmt.Formatter
 
 // The ReadTimeout and WriteTimeout don't actually work in Go
 // https://groups.google.com/forum/#!topic/golang-nuts/oBIh_R7-pJQ
-//const cliTout = 300 // http read/write/idle timeout
+// const cliTout = 300 // http read/write/idle timeout
 
-//ErrRetry Error when sending request
+// ErrRetry Error when sending request
 var ErrRetry = errors.New("Error sending request, please retry")
 
 const tunnelInactiveKillTimeout = 60 * time.Minute   // close dead tunnels
 const tunnelInactiveRefuseTimeout = 10 * time.Minute // refuse requests for dead tunnels
 
-//===== Data Structures =====
+// ===== Data Structures =====
 
 const (
-	//maxReq max queued requests per remote server
+	// maxReq max queued requests per remote server
 	maxReq = 20
-	//minTokenLen min number of chars in a token
+	// minTokenLen min number of chars in a token
 	minTokenLen = 16
 )
 
@@ -79,7 +78,7 @@ type remoteServer struct {
 	log             log15.Logger
 }
 
-//WSTunnelServer a wstunnel server construct
+// WSTunnelServer a wstunnel server construct
 type WSTunnelServer struct {
 	Port                int                     // port to listen on
 	Host                string                  // host to listen on
@@ -116,9 +115,14 @@ func ipAddrLookup(log log15.Logger, ipAddr string) (dns, who string) {
 	return
 }
 
-//===== Main =====
+const (
+	DevApi  = "https://devapi.monitic.com/api/v1/agents/jwt-test"
+	ProdApi = "https://api.monitic.com/api/v1/agents/jwt-test"
+)
 
-//NewWSTunnelServer function to create wstunnel from cli
+// ===== Main =====
+
+// NewWSTunnelServer function to create wstunnel from cli
 func NewWSTunnelServer(args []string) *WSTunnelServer {
 	wstunSrv := WSTunnelServer{}
 
@@ -147,7 +151,7 @@ func NewWSTunnelServer(args []string) *WSTunnelServer {
 	return &wstunSrv
 }
 
-//Start wstunnel server start
+// Start wstunnel server start
 func (t *WSTunnelServer) Start(listener net.Listener) {
 	t.Log.Info(VV)
 	if t.serverRegistry != nil {
@@ -156,12 +160,14 @@ func (t *WSTunnelServer) Start(listener net.Listener) {
 	t.serverRegistry = make(map[token]*remoteServer)
 	go t.idleTunnelReaper()
 
-	//===== HTTP Server =====
+	// ===== HTTP Server =====
 
 	var httpServer http.Server
 
 	// Convert a handler that takes a tunnel as first arg to a std http handler
-	wrap := func(h func(t *WSTunnelServer, w http.ResponseWriter, r *http.Request)) func(http.ResponseWriter, *http.Request) {
+	wrap := func(h func(t *WSTunnelServer, w http.ResponseWriter, r *http.Request)) func(
+		http.ResponseWriter, *http.Request,
+	) {
 		return func(w http.ResponseWriter, r *http.Request) {
 			h(t, w, r)
 		}
@@ -175,13 +181,13 @@ func (t *WSTunnelServer) Start(listener net.Listener) {
 	httpMux.HandleFunc("/_health_check", wrap(checkHandler))
 	httpMux.HandleFunc("/_stats", wrap(statsHandler))
 	httpServer.Handler = httpMux
-	//httpServer.ErrorLog = log15Logger // would like to set this somehow...
+	// httpServer.ErrorLog = log15Logger // would like to set this somehow...
 
 	// Read/Write timeouts disabled for now due to bug:
 	// https://code.google.com/p/go/issues/detail?id=6410
 	// https://groups.google.com/forum/#!topic/golang-nuts/oBIh_R7-pJQ
-	//ReadTimeout: time.Duration(cliTout) * time.Second, // read and idle timeout
-	//WriteTimeout: time.Duration(cliTout) * time.Second, // timeout while writing response
+	// ReadTimeout: time.Duration(cliTout) * time.Second, // read and idle timeout
+	// WriteTimeout: time.Duration(cliTout) * time.Second, // timeout while writing response
 
 	// Now create the listener and hook it all up
 	if listener == nil {
@@ -208,12 +214,12 @@ func (t *WSTunnelServer) Start(listener net.Listener) {
 	}()
 }
 
-//Stop wstunnelserver stop
+// Stop wstunnelserver stop
 func (t *WSTunnelServer) Stop() {
 	t.exitChan <- struct{}{}
 }
 
-//===== Handlers =====
+// ===== Handlers =====
 
 // Handler for health check
 func checkHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
@@ -262,8 +268,10 @@ func statsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "tunnel%02d_idle_secs=NaN\n", i)
 			badTunnels++
 		} else {
-			fmt.Fprintf(w, "tunnel%02d_idle_secs=%.1f\n", i,
-				time.Since(t.lastActivity).Seconds())
+			fmt.Fprintf(
+				w, "tunnel%02d_idle_secs=%.1f\n", i,
+				time.Since(t.lastActivity).Seconds(),
+			)
 			if time.Since(t.lastActivity).Seconds() > 60 {
 				badTunnels++
 			}
@@ -315,8 +323,8 @@ func payloadHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request, t
 	// create the request object
 	req := makeRequest(r, t.HTTPTimeout)
 	req.log = t.Log.New("token", cutToken(tok))
-	//req.token = tok
-	//log_token := cutToken(tok)
+	// req.token = tok
+	// log_token := cutToken(tok)
 
 	req.remoteAddr = r.Header.Get("X-Forwarded-For")
 	if req.remoteAddr == "" {
@@ -335,15 +343,19 @@ func payloadHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request, t
 // getResponse adds the request to a remote server and then waits to get a response back, and it
 // writes it. It returns true if the whole thing needs to be retried and false if we're done
 // sucessfully or not)
-func getResponse(t *WSTunnelServer, req *remoteRequest, w http.ResponseWriter, r *http.Request,
-	tok token, tries int) (retry bool) {
+func getResponse(
+	t *WSTunnelServer, req *remoteRequest, w http.ResponseWriter, r *http.Request,
+	tok token, tries int,
+) (retry bool) {
 	retry = false
 
 	// get a hold of the remote server
 	rs := t.getRemoteServer(token(tok), false)
 	if rs == nil {
-		req.log.Info("HTTP RCV", "addr", req.remoteAddr, "status", "404",
-			"err", "Tunnel not found")
+		req.log.Info(
+			"HTTP RCV", "addr", req.remoteAddr, "status", "404",
+			"err", "Tunnel not found",
+		)
 		http.Error(w, "Tunnel not found (or not seen in a long time)", 404)
 		return
 	}
@@ -356,8 +368,10 @@ func getResponse(t *WSTunnelServer, req *remoteRequest, w http.ResponseWriter, r
 	// enqueue request
 	err := rs.AddRequest(req)
 	if err != nil {
-		req.log.Info("HTTP RCV", "addr", req.remoteAddr, "status", "504",
-			"err", err.Error())
+		req.log.Info(
+			"HTTP RCV", "addr", req.remoteAddr, "status", "504",
+			"err", err.Error(),
+		)
 		http.Error(w, err.Error(), 504)
 		return
 	}
@@ -365,8 +379,10 @@ func getResponse(t *WSTunnelServer, req *remoteRequest, w http.ResponseWriter, r
 	if tries > 1 {
 		try = fmt.Sprintf("(attempt #%d)", tries)
 	}
-	req.log.Info("HTTP RCV", "verb", r.Method, "url", r.URL,
-		"addr", req.remoteAddr, "x-host", r.Header.Get("X-Host"), "try", try)
+	req.log.Info(
+		"HTTP RCV", "verb", r.Method, "url", r.URL,
+		"addr", req.remoteAddr, "x-host", r.Header.Get("X-Host"), "try", try,
+	)
 	// wait for response
 	select {
 	case resp := <-req.replyChan:
@@ -378,8 +394,10 @@ func getResponse(t *WSTunnelServer, req *remoteRequest, w http.ResponseWriter, r
 		}
 		// if it's a non-retryable error then write the error
 		if resp.err != ErrRetry {
-			req.log.Info("HTTP RET",
-				"status", "504", "err", resp.err.Error())
+			req.log.Info(
+				"HTTP RET",
+				"status", "504", "err", resp.err.Error(),
+			)
 			http.Error(w, resp.err.Error(), 504)
 		} else {
 			// else we're gonna retry
@@ -403,7 +421,7 @@ func tunnelHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-//===== Helpers =====
+// ===== Helpers =====
 
 // Sanitize the token for logging
 func cutToken(tok token) string {
@@ -431,7 +449,7 @@ func (t *WSTunnelServer) getRemoteServer(tok token, create bool) *remoteServer {
 }
 
 func (rs *remoteServer) AbortRequests() {
-	//logToken := cutToken(rs.tok)
+	// logToken := cutToken(rs.tok)
 	// end any requests that are queued
 l:
 	for {
@@ -522,8 +540,10 @@ func (t *WSTunnelServer) idleTunnelReaper() {
 		t.serverRegistryMutex.Lock()
 		for _, rs := range t.serverRegistry {
 			if time.Since(rs.lastActivity) > tunnelInactiveKillTimeout {
-				rs.log.Warn("Tunnel not seen for a long time, deleting",
-					"ago", time.Since(rs.lastActivity))
+				rs.log.Warn(
+					"Tunnel not seen for a long time, deleting",
+					"ago", time.Since(rs.lastActivity),
+				)
 				// unlink so new tunnels/tokens use a new RemoteServer object
 				delete(t.serverRegistry, rs.token)
 				go rs.AbortRequests()
@@ -532,5 +552,5 @@ func (t *WSTunnelServer) idleTunnelReaper() {
 		t.serverRegistryMutex.Unlock()
 		time.Sleep(time.Minute)
 	}
-	//t.Log.Debug("idleTunnelReaper ended")
+	// t.Log.Debug("idleTunnelReaper ended")
 }

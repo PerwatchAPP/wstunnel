@@ -27,11 +27,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
-	"os"
-	"regexp"
-	"runtime"
-
-	//"crypto/tls"
+	// "crypto/tls"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -41,10 +37,12 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-
 	// imported per documentation - https://golang.org/pkg/net/http/pprof/
 	_ "net/http/pprof"
 	"net/url"
+	"os"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,7 +73,9 @@ type WSTunnelClient struct {
 	exitChan       chan struct{}  // channel to tell the tunnel goroutines to end
 	conn           *WSConnection
 	ClientPorts    []int // array of ports for client to listen on.
-	//ws             *websocket.Conn // websocket connection
+	Type           string
+	jwt            string
+	// ws             *websocket.Conn // websocket connection
 }
 
 // WSConnection represents a single websocket connection
@@ -87,32 +87,47 @@ type WSConnection struct {
 
 var httpClient http.Client // client used for all requests, gets special transport for -insecure
 
-//===== Main =====
+// ===== Main =====
 
-//NewWSTunnelClient Creates a new WSTunnelClient from command line
+// NewWSTunnelClient Creates a new WSTunnelClient from command line
 func NewWSTunnelClient(args []string) *WSTunnelClient {
 	wstunCli := WSTunnelClient{}
 
 	var cliFlag = flag.NewFlagSet("client", flag.ExitOnError)
-	cliFlag.StringVar(&wstunCli.Token, "token", "",
-		"rendez-vous token identifying this server")
-	var tunnel = cliFlag.String("tunnel", "",
-		"websocket server ws[s]://user:pass@hostname:port to connect to")
-	cliFlag.StringVar(&wstunCli.Server, "server", "",
-		"http server http[s]://hostname:port to send received requests to")
-	cliFlag.BoolVar(&wstunCli.Insecure, "insecure", false,
-		"accept self-signed SSL certs from local HTTPS servers")
-	var sre = cliFlag.String("regexp", "",
-		"regexp for local HTTP(S) server to allow sending received requests to")
+	cliFlag.StringVar(
+		&wstunCli.Token, "token", "",
+		"rendez-vous token identifying this server",
+	)
+	var tunnel = cliFlag.String(
+		"tunnel", "",
+		"websocket server ws[s]://user:pass@hostname:port to connect to",
+	)
+	cliFlag.StringVar(
+		&wstunCli.Server, "server", "",
+		"http server http[s]://hostname:port to send received requests to",
+	)
+	cliFlag.BoolVar(
+		&wstunCli.Insecure, "insecure", false,
+		"accept self-signed SSL certs from local HTTPS servers",
+	)
+	var sre = cliFlag.String(
+		"regexp", "",
+		"regexp for local HTTP(S) server to allow sending received requests to",
+	)
 	var tout = cliFlag.Int("timeout", 30, "timeout on websocket in seconds")
 	var pidf = cliFlag.String("pidfile", "", "path for pidfile")
 	var logf = cliFlag.String("logfile", "", "path for log file")
 	var statf = cliFlag.String("statusfile", "", "path for status file")
-	var proxy = cliFlag.String("proxy", "",
-		"use HTTPS proxy http://user:pass@hostname:port")
-	var cliports = cliFlag.String("client-ports", "",
-		"comma separated list of client listening ports ex: -client-ports 8000..8100,8300..8400,8500,8505")
-
+	var proxy = cliFlag.String(
+		"proxy", "",
+		"use HTTPS proxy http://user:pass@hostname:port",
+	)
+	var cliports = cliFlag.String(
+		"client-ports", "",
+		"comma separated list of client listening ports ex: -client-ports 8000..8100,8300..8400,8500,8505",
+	)
+	var _type = cliFlag.String("type", "client", "type of tunnel client")
+	var jwt = cliFlag.String("jwt", "", "jwt token for authentication")
 	cliFlag.Parse(args)
 
 	wstunCli.Log = makeLogger("WStuncli", *logf, "")
@@ -150,7 +165,12 @@ func NewWSTunnelClient(args []string) *WSTunnelClient {
 			log15.Crit(fmt.Sprintf("Remote tunnel (-tunnel option) must begin with ws:// or wss://"))
 			os.Exit(1)
 		}
-
+		if *jwt == "" || *_type == "" {
+			log15.Crit(fmt.Sprintf("Must specify jwt token and type using -jwt and -type options"))
+			os.Exit(1)
+		}
+		wstunCli.jwt = *jwt
+		wstunCli.Type = *_type
 		wstunCli.Tunnel = tunnelUrl
 	} else {
 		log15.Crit(fmt.Sprintf("Must specify tunnel server ws://hostname:port using -tunnel option"))
@@ -226,7 +246,7 @@ func NewWSTunnelClient(args []string) *WSTunnelClient {
 	return &wstunCli
 }
 
-//Start creates the wstunnel connection.
+// Start creates the wstunnel connection.
 func (t *WSTunnelClient) Start() error {
 	t.Log.Info(VV)
 
@@ -275,7 +295,7 @@ func (t *WSTunnelClient) Start() error {
 	// a fresh connection.
 	t.exitChan = make(chan struct{}, 1)
 
-	//===== Goroutine =====
+	// ===== Goroutine =====
 
 	// Keep opening websocket connections to tunnel requests
 	go func() {
@@ -291,7 +311,7 @@ func (t *WSTunnelClient) Start() error {
 			if auth := proxyAuth(t.Tunnel); auth != "" {
 				h.Add("Authorization", auth)
 			}
-			url := fmt.Sprintf("%s://%s/_tunnel", t.Tunnel.Scheme, t.Tunnel.Host)
+			url := fmt.Sprintf("%s://%s/_tunnel?type=%s&token=%s", t.Tunnel.Scheme, t.Tunnel.Host, t.Type, t.jwt)
 			timer := time.NewTimer(10 * time.Second)
 			t.Log.Info("WS   Opening", "url", url, "token", t.Token[0:5]+"...")
 			ws, resp, err := d.Dial(url, h)
@@ -306,11 +326,15 @@ func (t *WSTunnelClient) Start() error {
 					}
 					resp.Body.Close()
 				}
-				t.Log.Error("Error opening connection",
-					"err", err.Error(), "info", extra)
+				t.Log.Error(
+					"Error opening connection",
+					"err", err.Error(), "info", extra,
+				)
 			} else {
-				t.conn = &WSConnection{ws: ws, tun: t,
-					Log: t.Log.New("ws", fmt.Sprintf("%p", ws))}
+				t.conn = &WSConnection{
+					ws: ws, tun: t,
+					Log: t.Log.New("ws", fmt.Sprintf("%p", ws)),
+				}
 				// Safety setting
 				ws.SetReadLimit(100 * 1024 * 1024)
 				// Request Loop
@@ -341,7 +365,7 @@ func (t *WSTunnelClient) Start() error {
 	return nil
 }
 
-//Stop closes the wstunnel channel
+// Stop closes the wstunnel channel
 func (t *WSTunnelClient) Stop() {
 	t.exitChan <- struct{}{}
 	if t.conn != nil && t.conn.ws != nil {
@@ -407,7 +431,7 @@ func (wsc *WSConnection) handleRequests() {
 	}()
 }
 
-//===== Keep-alive ping-pong =====
+// ===== Keep-alive ping-pong =====
 
 // Pinger that keeps connections alive and terminates them if they seem stuck
 func (wsc *WSConnection) pinger() {
@@ -491,7 +515,7 @@ func (t *WSTunnelClient) wsDialerLocalPort(network string, addr string, ports []
 	return nil, err
 }
 
-//===== Proxy support =====
+// ===== Proxy support =====
 // Bits of this taken from golangs net/http/transport.go. Gorilla websocket lib
 // allows you to pass in a custom net.Dial function, which it will call instead
 // of net.Dial. net.Dial normally just opens up a tcp socket for you. We go one
@@ -537,9 +561,9 @@ func (t *WSTunnelClient) wsProxyDialer(network string, addr string) (conn net.Co
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		//body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
-		//resp.Body.Close()
-		//return nil, errors.New("proxy refused connection" + string(body))
+		// body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, 500))
+		// resp.Body.Close()
+		// return nil, errors.New("proxy refused connection" + string(body))
 		f := strings.SplitN(resp.Status, " ", 2)
 		conn.Close()
 		return nil, fmt.Errorf(f[1])
@@ -564,7 +588,7 @@ func basicAuth(username, password string) string {
 	return base64.StdEncoding.EncodeToString([]byte(auth))
 }
 
-//===== HTTP Header Stuff =====
+// ===== HTTP Header Stuff =====
 
 // Hop-by-hop headers. These are removed when sent to the backend.
 // http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html
@@ -580,7 +604,7 @@ var hopHeaders = []string{
 	"Host",
 }
 
-//===== HTTP response writer, used for internal request handlers
+// ===== HTTP response writer, used for internal request handlers
 
 type responseWriter struct {
 	resp *http.Response
@@ -628,7 +652,7 @@ func (rw *responseWriter) finishResponse() error {
 	return nil
 }
 
-//===== HTTP driver and response sender =====
+// ===== HTTP driver and response sender =====
 
 var wsWriterMutex sync.Mutex // mutex to allow a single goroutine to send a response at a time
 
@@ -671,8 +695,8 @@ func (wsc *WSConnection) finishInternalRequest(id int16, req *http.Request) {
 
 	err := rw.finishResponse()
 	if err != nil {
-		//dump2, _ := httputil.DumpResponse(resp, true)
-		//log15.Info("handleWsRequests: request error", "err", err.Error(),
+		// dump2, _ := httputil.DumpResponse(resp, true)
+		// log15.Info("handleWsRequests: request error", "err", err.Error(),
 		//	"req", string(dump), "resp", string(dump2))
 		log.Info("HTTP request error", "err", err.Error())
 		wsc.writeResponseMessage(id, concoctResponse(req, err.Error(), 502))
@@ -694,23 +718,37 @@ func (wsc *WSConnection) finishRequest(id int16, req *http.Request) {
 		re := wsc.tun.Regexp
 		if re == nil {
 			log.Info("WS   got x-host header but no regexp provided")
-			wsc.writeResponseMessage(id, concoctResponse(req,
-				"X-Host header disallowed by wstunnel cli (no -regexp option)", 403))
+			wsc.writeResponseMessage(
+				id, concoctResponse(
+					req,
+					"X-Host header disallowed by wstunnel cli (no -regexp option)", 403,
+				),
+			)
 			return
 		} else if re.FindString(xHost) == xHost {
 			host = xHost
 		} else {
-			log.Info("WS   x-host disallowed by regexp", "x-host", xHost, "regexp",
-				re.String(), "match", re.FindString(xHost))
-			wsc.writeResponseMessage(id, concoctResponse(req,
-				"X-Host header '"+xHost+"' does not match regexp in wstunnel cli",
-				403))
+			log.Info(
+				"WS   x-host disallowed by regexp", "x-host", xHost, "regexp",
+				re.String(), "match", re.FindString(xHost),
+			)
+			wsc.writeResponseMessage(
+				id, concoctResponse(
+					req,
+					"X-Host header '"+xHost+"' does not match regexp in wstunnel cli",
+					403,
+				),
+			)
 			return
 		}
 	} else if host == "" {
 		log.Info("WS   no x-host header and -server not specified")
-		wsc.writeResponseMessage(id, concoctResponse(req,
-			"X-Host header required by wstunnel cli (no -server option)", 403))
+		wsc.writeResponseMessage(
+			id, concoctResponse(
+				req,
+				"X-Host header required by wstunnel cli (no -server option)", 403,
+			),
+		)
 		return
 	}
 	req.Header.Del("X-Host")
@@ -739,8 +777,8 @@ func (wsc *WSConnection) finishRequest(id int16, req *http.Request) {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		//dump2, _ := httputil.DumpResponse(resp, true)
-		//log15.Info("handleWsRequests: request error", "err", err.Error(),
+		// dump2, _ := httputil.DumpResponse(resp, true)
+		// log15.Info("handleWsRequests: request error", "err", err.Error(),
 		//	"req", strings.Replace(string(dump), "\r\n", " || ", -1))
 		log.Info("HTTP request error", "err", err.Error())
 		wsc.writeResponseMessage(id, concoctResponse(req, err.Error(), 502))
@@ -796,7 +834,7 @@ func (wsc *WSConnection) writeResponseMessage(id int16, resp *http.Response) {
 // don't know what it is
 func concoctResponse(req *http.Request, message string, code int) *http.Response {
 	r := http.Response{
-		Status:     "Bad Gateway", //strconv.Itoa(code),
+		Status:     "Bad Gateway", // strconv.Itoa(code),
 		StatusCode: code,
 		Proto:      req.Proto,
 		ProtoMajor: req.ProtoMajor,

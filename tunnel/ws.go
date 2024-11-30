@@ -10,7 +10,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-
 	// imported per documentation - https://golang.org/pkg/net/http/pprof/
 	_ "net/http/pprof"
 	"time"
@@ -26,17 +25,60 @@ func httpError(log log15.Logger, w http.ResponseWriter, token, err string, code 
 	http.Error(w, html.EscapeString(err), code)
 }
 
-//websocket error constants
+// websocket error constants
 const (
 	wsReadClose  = iota
 	wsReadError  = iota
 	wsWriteError = iota
 )
 
+func checkJwt(_type string, jwt string) bool {
+	api := DevApi
+	switch _type {
+	case "dev":
+		api = DevApi
+	case "prod":
+		api = ProdApi
+	default:
+		return false
+	}
+
+	req, err := http.NewRequest("GET", api, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", "Bearer "+jwt)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+
+	if resp.StatusCode != 200 {
+		return false
+	}
+
+	return true
+}
+
 func wsp(ws *websocket.Conn) string { return fmt.Sprintf("%p", ws) }
 
 // Handler for websockets tunnel establishment requests
 func wsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
+	// get type and jwt token from the request's query parameters
+	_type, ok := r.URL.Query()["type"]
+	if !ok || len(_type) < 1 {
+		httpError(t.Log, w, "", "Url Param 'type' is missing", 400)
+		return
+	}
+
+	jwt, ok := r.URL.Query()["token"]
+	if !ok || len(jwt) < 1 {
+		httpError(t.Log, w, "", "Url Param 'token' is missing", 400)
+		return
+	}
+
 	addr := r.Header.Get("X-Forwarded-For")
 	if addr == "" {
 		addr = r.RemoteAddr
@@ -48,22 +90,37 @@ func wsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(tok) < minTokenLen {
-		httpError(t.Log, w, addr,
-			fmt.Sprintf("Rendez-vous token (%s) is too short (must be %d chars)",
-				tok, minTokenLen), 400)
+		httpError(
+			t.Log, w, addr,
+			fmt.Sprintf(
+				"Rendez-vous token (%s) is too short (must be %d chars)",
+				tok, minTokenLen,
+			), 400,
+		)
 		return
 	}
+
+	// Verify that the token is valid
+	if !checkJwt(_type[0], jwt[0]) {
+		httpError(t.Log, w, addr, "Invalid JWT token", 400)
+		return
+	}
+
 	logTok := cutToken(token(tok))
 	// Upgrade to web sockets
 	ws, err := websocket.Upgrade(w, r, nil, 100*1024, 100*1024)
 	if _, ok := err.(websocket.HandshakeError); ok {
-		t.Log.Info("WS new tunnel connection rejected", "token", logTok, "addr", addr,
-			"err", "Not a websocket handshake")
+		t.Log.Info(
+			"WS new tunnel connection rejected", "token", logTok, "addr", addr,
+			"err", "Not a websocket handshake",
+		)
 		httpError(t.Log, w, logTok, "Not a websocket handshake", 400)
 		return
 	} else if err != nil {
-		t.Log.Info("WS new tunnel connection rejected", "token", logTok, "addr", addr,
-			"err", err.Error())
+		t.Log.Info(
+			"WS new tunnel connection rejected", "token", logTok, "addr", addr,
+			"err", err.Error(),
+		)
 		httpError(t.Log, w, logTok, err.Error(), 400)
 		return
 	}
@@ -71,8 +128,10 @@ func wsHandler(t *WSTunnelServer, w http.ResponseWriter, r *http.Request) {
 	rs := t.getRemoteServer(token(tok), true)
 	rs.remoteAddr = addr
 	rs.lastActivity = time.Now()
-	t.Log.Info("WS new tunnel connection", "token", logTok, "addr", addr, "ws", wsp(ws),
-		"rs", rs)
+	t.Log.Info(
+		"WS new tunnel connection", "token", logTok, "addr", addr, "ws", wsp(ws),
+		"rs", rs,
+	)
 	// do reverse DNS lookup asynchronously
 	go func() {
 		rs.remoteName, rs.remoteWhois = ipAddrLookup(t.Log, rs.remoteAddr)
@@ -125,14 +184,16 @@ func wsWriter(rs *remoteServer, ws *websocket.Conn, ch chan int) {
 			ws.Close()
 			return
 		}
-		//log.Printf("WS->%s#%d start %s", req.token, req.id, req.info)
+		// log.Printf("WS->%s#%d start %s", req.token, req.id, req.info)
 		// See whether the request has already expired
 		if req.deadline.Before(time.Now()) {
 			req.replyChan <- responseBuffer{
 				err: errors.New("Timeout before forwarding the request"),
 			}
-			req.log.Info("WS   SND timeout before sending", "ago",
-				time.Now().Sub(req.deadline).Seconds())
+			req.log.Info(
+				"WS   SND timeout before sending", "ago",
+				time.Now().Sub(req.deadline).Seconds(),
+			)
 			continue
 		}
 		// write the request into the tunnel
